@@ -200,6 +200,40 @@ pip install -r requirements.txt
 python3 robot_path_optimization.py
 ```
 
+## Web App
+
+The project now includes a simple interactive web interface that animates the path optimization in the browser.
+
+```bash
+# Start the web server
+python3 app.py
+```
+
+Then open:
+
+```
+http://127.0.0.1:5000
+```
+
+The web app shows:
+- the obstacle field
+- the initial straight-line path
+- the optimized path evolution
+- live metrics for path length and collision status
+
+## GitHub Actions Deployment
+
+A GitHub Actions workflow has been added at `.github/workflows/deploy.yml`.
+It builds the project, verifies the Python application, and prepares a Docker container.
+
+To enable Heroku deployment, add the following repository secrets in GitHub:
+- `HEROKU_API_KEY`
+- `HEROKU_APP_NAME`
+- `HEROKU_EMAIL`
+
+With those secrets set, pushes to `main` will automatically deploy the Flask app to Heroku.
+
+
 **Output:**
 - Console output with all metrics
 - `path_optimization_results.png` — 4-panel visualization figure
