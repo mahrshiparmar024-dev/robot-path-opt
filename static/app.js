@@ -116,6 +116,22 @@ function renderMetrics(data) {
 function drawSimulation(data) {
     const obstacleTraces = buildObstacleTraces(data.obstacles);
 
+    const contourTrace = {
+        z: data.V,
+        x: data.x_grid,
+        y: data.y_grid,
+        type: 'contour',
+        colorscale: 'RdYlGn',
+        reversescale: true,
+        opacity: 0.6,
+        showscale: false,
+        name: 'Potential Field',
+        hoverinfo: 'none',
+        contours: {
+            coloring: 'heatmap'
+        }
+    };
+
     const endpointTrace = {
         x: [data.start[0], data.goal[0]],
         y: [data.start[1], data.goal[1]],
@@ -145,9 +161,12 @@ function drawSimulation(data) {
         name: `Optimized Path (L=${data.final_length.toFixed(2)})`,
     };
 
+    const traceIdx = obstacleTraces.length + 2;  // after contour(1) + obstacles(N) + initialTrace(1)
+
     const frames = data.snapshots.map((snap, i) => ({
         name: `step-${i}`,
         data: [{ x: snap.map(p => p[0]), y: snap.map(p => p[1]) }],
+        traces: [traceIdx]
     }));
 
     const sliderSteps = data.snapshots.map((_, i) => ({
@@ -180,8 +199,7 @@ function drawSimulation(data) {
     };
 
     // animatedTrace must be at the right index so frames update it
-    const traceIdx = obstacleTraces.length + 1;  // after obstacles + initialTrace
-    const allTraces = [...obstacleTraces, initialTrace, animatedTrace, endpointTrace];
+    const allTraces = [contourTrace, ...obstacleTraces, initialTrace, animatedTrace, endpointTrace];
 
     Plotly.newPlot(plotElement, allTraces, layout, { responsive: true });
     Plotly.addFrames(plotElement, frames);

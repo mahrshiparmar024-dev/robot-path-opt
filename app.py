@@ -43,9 +43,10 @@ def api_run():
     # Accept optional seed; if absent, each run is random
     seed = request.args.get("seed", default=None, type=int)
 
-    optimized_path, initial_path, cost_history, path_snapshots, obstacles, used_seed = (
+    optimized_path, initial_path, cost_history, path_snapshots, obstacles, used_seed, grid_data = (
         optimize_path(START, GOAL, [], seed=seed)
     )
+    x_grid, y_grid, V, _, _, _, _ = grid_data
 
     return jsonify(
         {
@@ -61,6 +62,9 @@ def api_run():
             "iterations": len(cost_history),
             "final_collision": bool(check_collision(optimized_path, obstacles)),
             "cost_history": [float(c) for c in cost_history],
+            "x_grid": [float(v) for v in x_grid[::2]],
+            "y_grid": [float(v) for v in y_grid[::2]],
+            "V": V[::2, ::2].tolist(),
         }
     )
 
