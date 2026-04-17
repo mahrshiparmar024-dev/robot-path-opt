@@ -86,7 +86,7 @@ START = np.array([0.0, 0.0])
 GOAL = np.array([10.0, 10.0])
 
 # Optimization parameters
-N_WAYPOINTS = 25          # Internal waypoints (total path = N+2 points)
+N_WAYPOINTS = 100         # Internal waypoints (total path = N+2 points)
 LEARNING_RATE = 0.02      # Gradient descent step size
 MAX_ITERATIONS = 500      # Maximum optimization iterations
 K_OBS = 20.0              # Obstacle repulsion strength
@@ -340,8 +340,18 @@ def point_collides_with_obstacle(point, obstacle, margin=0.0):
 
 
 def check_collision(path, obstacles, margin=0.0):
-    """Check if any point on the path collides with any obstacle."""
-    for point in path:
+    """Check if any segment on the path collides with any obstacle via dense interpolation."""
+    interpolated_path = []
+    for i in range(len(path) - 1):
+        p1 = path[i]
+        p2 = path[i+1]
+        dist = np.linalg.norm(p2 - p1)
+        samples = max(2, int(dist / 0.1)) # Sample every 0.1 units
+        for t in np.linspace(0, 1, samples, endpoint=False):
+            interpolated_path.append(p1 * (1 - t) + p2 * t)
+    interpolated_path.append(path[-1])
+
+    for point in interpolated_path:
         for obs in obstacles:
             if point_collides_with_obstacle(point, obs, margin):
                 return True
@@ -521,7 +531,7 @@ def compute_total_gradient_apf(path, interp_Fx_rep, interp_Fy_rep):
     
     # Scale APF forces nicely so tension can fight them correctly
     obs_force = np.column_stack((fx_rep, fy_rep))
-    grad[1:-1] -= obs_force * 0.15  # Negative because grad pushes opposite to cost gradient (force pushes inherently)
+    grad[1:-1] -= obs_force * 2.0  # Boosted APF repulsive multiplier to prevent corner shearing
 
     # ── 3. SMOOTHNESS GRADIENT (vectorized) ──
     laplacian = path[2:] - 2 * inner + path[:-2]
@@ -535,6 +545,18 @@ def compute_total_gradient_apf(path, interp_Fx_rep, interp_Fy_rep):
         grad[1:-1] *= scale
 
     return grad
+
+def densify_path(path, max_step=0.1):
+    """Subdivide segments to ensure waypoint density is extremely high for rigorous checking."""
+    new_path = [path[0]]
+    for i in range(len(path) - 1):
+        p1 = path[i]
+        p2 = path[i+1]
+        dist = np.linalg.norm(p2 - p1)
+        steps = max(1, int(np.ceil(dist / max_step)))
+        for j in range(1, steps + 1):
+            new_path.append(p1 + (p2 - p1) * (j / steps))
+    return np.array(new_path)
 
 def post_process_collision_repair(path, obstacles, max_passes=50):
     """
@@ -596,7 +618,7 @@ def optimize_path(start, goal, obstacles, seed=None):
     circle_primitives = obstacles_to_circle_primitives(obstacles)
     
     # Pre-compute the force field over a grid for interpolation
-    grid_res = 100
+    grid_res = 300
     x_grid = np.linspace(-1.5, 11.5, grid_res)
     y_grid = np.linspace(-1.5, 11.5, grid_res)
     X, Y = np.meshgrid(x_grid, y_grid)
@@ -641,7 +663,8 @@ def optimize_path(start, goal, obstacles, seed=None):
             if max(recent) - min(recent) < 1e-6:
                 break
                 
-    # Repair any residual collisions
+    # Repair any residual collisions by densifying string and pushing tight to bounds
+    path = densify_path(path, max_step=0.05)
     path = post_process_collision_repair(path, obstacles)
     path_snapshots.append(path.copy())
     
