@@ -85,14 +85,14 @@ START = np.array([0.0, 0.0])
 GOAL = np.array([10.0, 10.0])
 
 # Optimization parameters
-N_WAYPOINTS = 50          # Internal waypoints (total path = N+2 points)
-LEARNING_RATE = 0.015     # Gradient descent step size
-MAX_ITERATIONS = 1000     # Maximum optimization iterations
-K_OBS = 15.0              # Obstacle repulsion strength
-K_SMOOTH = 0.12           # Path smoothness weight
+N_WAYPOINTS = 25          # Internal waypoints (total path = N+2 points)
+LEARNING_RATE = 0.02      # Gradient descent step size
+MAX_ITERATIONS = 500      # Maximum optimization iterations
+K_OBS = 20.0              # Obstacle repulsion strength
+K_SMOOTH = 0.15           # Path smoothness weight
 SAFETY_MARGIN = 0.5       # Extra clearance around obstacles
 RHO_0 = 3.0               # Obstacle influence radius beyond surface
-GRAD_CLIP = 4.0           # Maximum gradient magnitude per waypoint
+GRAD_CLIP = 5.0           # Maximum gradient magnitude per waypoint
 K_ATT = 1.0               # Attractive potential gain (for field visualization)
 
 
@@ -252,24 +252,19 @@ def obstacle_to_circles(obstacle, n_samples=12):
     elif obstacle['type'] == 'polygon':
         verts = np.array(obstacle['vertices'])
         center = verts.mean(axis=0)
-        # Compute characteristic radius
         dists = np.linalg.norm(verts - center, axis=1)
         max_r = dists.max()
 
         circles = []
-        # Center circle
-        circles.append((center[0], center[1], max_r * 0.4))
+        # Single center circle covers most of the shape
+        circles.append((center[0], center[1], max_r * 0.5))
 
-        # Edge midpoint circles
+        # Edge midpoint circles only (skip vertex circles to reduce count)
         n = len(verts)
         for i in range(n):
             mid = (verts[i] + verts[(i+1) % n]) / 2.0
             edge_len = np.linalg.norm(verts[(i+1) % n] - verts[i])
-            circles.append((mid[0], mid[1], edge_len * 0.35))
-
-        # Vertex circles
-        for v in verts:
-            circles.append((v[0], v[1], max_r * 0.2))
+            circles.append((mid[0], mid[1], edge_len * 0.3))
 
         return circles
 
@@ -482,9 +477,10 @@ def compute_path_length(path):
 # GRADIENT DESCENT OPTIMIZATION (Vector Calculus: Gradient)
 # ==============================================================================
 
-def compute_total_gradient(path, circle_primitives):
+def compute_total_gradient(path, circle_primitives_arr):
     """
     Compute the analytical gradient of the total cost w.r.t. waypoints.
+    VECTORIZED using numpy broadcasting for speed.
 
     The cost function has three components:
     1. Path Length (line integral) — ∂L/∂P_k
@@ -497,40 +493,52 @@ def compute_total_gradient(path, circle_primitives):
     """
     n = len(path)
     grad = np.zeros_like(path)
+    inner = path[1:-1]  # shape (n-2, 2)
 
-    for k in range(1, n - 1):
-        # ── 1. PATH LENGTH GRADIENT (Line Integral) ──
-        # ∂L/∂P_k = (P_k - P_{k-1})/||P_k - P_{k-1}|| - (P_{k+1} - P_k)/||P_{k+1} - P_k||
-        d_prev = path[k] - path[k - 1]
-        d_next = path[k + 1] - path[k]
-        n_prev = max(np.linalg.norm(d_prev), 1e-10)
-        n_next = max(np.linalg.norm(d_next), 1e-10)
-        grad[k] += d_prev / n_prev - d_next / n_next
+    # ── 1. PATH LENGTH GRADIENT (vectorized) ──
+    d_prev = inner - path[:-2]         # P_k - P_{k-1}
+    d_next = path[2:] - inner          # P_{k+1} - P_k
+    n_prev = np.maximum(np.linalg.norm(d_prev, axis=1, keepdims=True), 1e-10)
+    n_next = np.maximum(np.linalg.norm(d_next, axis=1, keepdims=True), 1e-10)
+    grad[1:-1] += d_prev / n_prev - d_next / n_next
 
-        # ── 2. OBSTACLE REPULSION GRADIENT (Potential Field) ──
-        # ∂V_rep/∂P_k = K * (1/ρ - 1/ρ₀) * (1/ρ²) * (-(P_k - center)/d)
-        for cx, cy, r in circle_primitives:
-            center = np.array([cx, cy])
-            diff = path[k] - center
-            d = np.linalg.norm(diff)
-            rho = max(d - r, 0.01)
+    # ── 2. OBSTACLE REPULSION GRADIENT (vectorized) ──
+    # circle_primitives_arr: numpy array shape (M, 3) — [cx, cy, r]
+    if len(circle_primitives_arr) > 0:
+        obs_centers = circle_primitives_arr[:, :2]  # (M, 2)
+        obs_radii = circle_primitives_arr[:, 2]     # (M,)
 
-            if rho < RHO_0 and d > 0.01:
-                factor = K_OBS * (1.0 / rho - 1.0 / RHO_0) * (1.0 / rho**2)
-                # Gradient points toward obstacle; GD step pushes away
-                grad[k] += factor * (-diff / d)
+        # diff[k, m] = path[k] - obs_center[m], shape (n-2, M, 2)
+        diff = inner[:, np.newaxis, :] - obs_centers[np.newaxis, :, :]
+        # distances, shape (n-2, M)
+        d = np.linalg.norm(diff, axis=2)
+        d_safe = np.maximum(d, 0.01)
+        # rho = distance to surface
+        rho = np.maximum(d - obs_radii[np.newaxis, :], 0.01)
 
-        # ── 3. SMOOTHNESS GRADIENT (Parametric Curve Curvature) ──
-        # Penalizes second derivative of parametric curve: ||d²r/dt²||²
-        # ∂S/∂P_k ≈ -2 * K_smooth * (P_{k+1} - 2P_k + P_{k-1})
-        laplacian = path[k + 1] - 2 * path[k] + path[k - 1]
-        grad[k] += -2 * K_SMOOTH * laplacian
+        # mask: only where rho < RHO_0 and d > 0.01
+        mask = (rho < RHO_0) & (d > 0.01)
 
-    # Gradient clipping for stability
-    for k in range(1, n - 1):
-        g_norm = np.linalg.norm(grad[k])
-        if g_norm > GRAD_CLIP:
-            grad[k] = grad[k] / g_norm * GRAD_CLIP
+        # factor = K_OBS * (1/rho - 1/RHO_0) * (1/rho^2)
+        factor = np.zeros_like(rho)
+        factor[mask] = K_OBS * (1.0 / rho[mask] - 1.0 / RHO_0) * (1.0 / rho[mask]**2)
+
+        # gradient contribution: factor * (-diff / d)
+        # shape (n-2, M, 2)
+        obs_grad = factor[:, :, np.newaxis] * (-diff / d_safe[:, :, np.newaxis])
+        # sum over all obstacles, shape (n-2, 2)
+        grad[1:-1] += obs_grad.sum(axis=1)
+
+    # ── 3. SMOOTHNESS GRADIENT (vectorized) ──
+    laplacian = path[2:] - 2 * inner + path[:-2]
+    grad[1:-1] += -2 * K_SMOOTH * laplacian
+
+    # Gradient clipping (vectorized)
+    g_norms = np.linalg.norm(grad[1:-1], axis=1, keepdims=True)
+    clip_mask = g_norms > GRAD_CLIP
+    if clip_mask.any():
+        scale = np.where(clip_mask, GRAD_CLIP / np.maximum(g_norms, 1e-10), 1.0)
+        grad[1:-1] *= scale
 
     return grad
 
@@ -601,6 +609,7 @@ def optimize_path(start, goal, obstacles, seed=None):
 
     # Convert to circle primitives for gradient computation
     circle_primitives = obstacles_to_circle_primitives(obstacles)
+    circle_primitives_arr = np.array(circle_primitives) if circle_primitives else np.empty((0, 3))
 
     path = create_straight_path(start, goal, N_WAYPOINTS)
     initial_path = path.copy()
@@ -609,8 +618,8 @@ def optimize_path(start, goal, obstacles, seed=None):
     path_snapshots = [path.copy()]
 
     for iteration in range(MAX_ITERATIONS):
-        # Compute gradient
-        grad = compute_total_gradient(path, circle_primitives)
+        # Compute gradient (vectorized)
+        grad = compute_total_gradient(path, circle_primitives_arr)
 
         # Adaptive learning rate (decay)
         lr = LEARNING_RATE * (1.0 / (1.0 + iteration * 0.001))
