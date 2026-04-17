@@ -76,7 +76,6 @@ from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.collections import LineCollection
 from matplotlib import cm
 import time
-from scipy.interpolate import RegularGridInterpolator
 
 # ==============================================================================
 # CONFIGURATION
@@ -432,31 +431,17 @@ def compute_potential_gradient_field(X, Y, goal, circle_primitives):
         F = -∇V points toward lower potential (goal) and away from obstacles.
 
     Also computes DIVERGENCE: div(F) = ∂Fx/∂x + ∂Fy/∂y
-    And CURL: curl(F) = ∂Fy/∂x - ∂Fx/∂y
     """
-    V_att = attractive_potential(X, Y, goal)
-    V_rep = repulsive_potential(X, Y, circle_primitives)
-    V = V_att + V_rep
-    
-    # Calculate grid spacings explicitly to make np.gradient robust
-    dy = Y[1, 0] - Y[0, 0] if Y.shape[0] > 1 else 1.0
-    dx = X[0, 1] - X[0, 0] if X.shape[1] > 1 else 1.0
-    
-    # Total force vectors
-    dV_dy, dV_dx = np.gradient(V, dy, dx)
+    V = total_potential(X, Y, goal, circle_primitives)
+    dV_dy, dV_dx = np.gradient(V)
     Fx, Fy = -dV_dx, -dV_dy  # Force = negative gradient
-    
-    # Pure repulsive force vectors (used for waypoint pushing avoiding goal clumping)
-    dVrep_dy, dVrep_dx = np.gradient(V_rep, dy, dx)
-    F_rep_x, F_rep_y = -dVrep_dx, -dVrep_dy
 
-    # Divergence: div(F) = ∂Fx/∂x + ∂Fy/∂y and Curl: ∂Fy/∂x - ∂Fx/∂y
-    dFx_dy, dFx_dx = np.gradient(Fx, dy, dx)
-    dFy_dy, dFy_dx = np.gradient(Fy, dy, dx)
+    # Divergence: div(F) = ∂Fx/∂x + ∂Fy/∂y
+    _, dFx_dx = np.gradient(Fx)
+    dFy_dy, _ = np.gradient(Fy)
     divergence = dFx_dx + dFy_dy
-    curl = dFy_dx - dFx_dy # Exact physical definition of curl for 2D vector field
 
-    return V, Fx, Fy, F_rep_x, F_rep_y, divergence, curl
+    return V, Fx, Fy, divergence
 
 
 # ==============================================================================
@@ -489,18 +474,22 @@ def compute_path_length(path):
 
 
 # ==============================================================================
-# APF TRAJECTORY SIMULATION (Vector Calculus: Integral Curves)
+# GRADIENT DESCENT OPTIMIZATION (Vector Calculus: Gradient)
 # ==============================================================================
 
-def compute_total_gradient_apf(path, interp_Fx_rep, interp_Fy_rep):
+def compute_total_gradient(path, circle_primitives_arr):
     """
     Compute the analytical gradient of the total cost w.r.t. waypoints.
-    VECTORIZED using numpy broadcasting.
+    VECTORIZED using numpy broadcasting for speed.
 
-    This combines the Continuous APF field interpolator with Elastic Band tension.
+    The cost function has three components:
     1. Path Length (line integral) — ∂L/∂P_k
-    2. Obstacle Penalty (from Continuous APF grid) — F_rep(P_k)
+    2. Obstacle Penalty (potential field) — ∂V_rep/∂P_k
     3. Smoothness (curvature of parametric curve) — ∂S/∂P_k
+
+    Vector Calculus: GRADIENT used in two ways:
+    - Gradient of path length functional (calculus of variations)
+    - Gradient of obstacle potential (scalar field gradient)
     """
     n = len(path)
     grad = np.zeros_like(path)
@@ -513,21 +502,38 @@ def compute_total_gradient_apf(path, interp_Fx_rep, interp_Fy_rep):
     n_next = np.maximum(np.linalg.norm(d_next, axis=1, keepdims=True), 1e-10)
     grad[1:-1] += d_prev / n_prev - d_next / n_next
 
-    # ── 2. OBSTACLE REPULSION GRADIENT (from APF Grid Interpolator) ──
-    # Sample the continuous force field directly at each waypoint!
-    # Because V(x,y) grid maps (y_grid, x_grid), we pass (Y, X) to iterpolator
-    fx_rep = interp_Fx_rep((inner[:, 1], inner[:, 0]))
-    fy_rep = interp_Fy_rep((inner[:, 1], inner[:, 0]))
-    
-    # Scale APF forces nicely so tension can fight them correctly
-    obs_force = np.column_stack((fx_rep, fy_rep))
-    grad[1:-1] -= obs_force * 0.15  # Negative because grad pushes opposite to cost gradient (force pushes inherently)
+    # ── 2. OBSTACLE REPULSION GRADIENT (vectorized) ──
+    # circle_primitives_arr: numpy array shape (M, 3) — [cx, cy, r]
+    if len(circle_primitives_arr) > 0:
+        obs_centers = circle_primitives_arr[:, :2]  # (M, 2)
+        obs_radii = circle_primitives_arr[:, 2]     # (M,)
+
+        # diff[k, m] = path[k] - obs_center[m], shape (n-2, M, 2)
+        diff = inner[:, np.newaxis, :] - obs_centers[np.newaxis, :, :]
+        # distances, shape (n-2, M)
+        d = np.linalg.norm(diff, axis=2)
+        d_safe = np.maximum(d, 0.01)
+        # rho = distance to surface
+        rho = np.maximum(d - obs_radii[np.newaxis, :], 0.01)
+
+        # mask: only where rho < RHO_0 and d > 0.01
+        mask = (rho < RHO_0) & (d > 0.01)
+
+        # factor = K_OBS * (1/rho - 1/RHO_0) * (1/rho^2)
+        factor = np.zeros_like(rho)
+        factor[mask] = K_OBS * (1.0 / rho[mask] - 1.0 / RHO_0) * (1.0 / rho[mask]**2)
+
+        # gradient contribution: factor * (-diff / d)
+        # shape (n-2, M, 2)
+        obs_grad = factor[:, :, np.newaxis] * (-diff / d_safe[:, :, np.newaxis])
+        # sum over all obstacles, shape (n-2, 2)
+        grad[1:-1] += obs_grad.sum(axis=1)
 
     # ── 3. SMOOTHNESS GRADIENT (vectorized) ──
     laplacian = path[2:] - 2 * inner + path[:-2]
     grad[1:-1] += -2 * K_SMOOTH * laplacian
 
-    # Gradient clipping (vectorized) for numerical stability
+    # Gradient clipping (vectorized)
     g_norms = np.linalg.norm(grad[1:-1], axis=1, keepdims=True)
     clip_mask = g_norms > GRAD_CLIP
     if clip_mask.any():
@@ -535,6 +541,7 @@ def compute_total_gradient_apf(path, interp_Fx_rep, interp_Fy_rep):
         grad[1:-1] *= scale
 
     return grad
+
 
 def post_process_collision_repair(path, obstacles, max_passes=50):
     """
@@ -547,6 +554,7 @@ def post_process_collision_repair(path, obstacles, max_passes=50):
             for obs in obstacles:
                 if point_collides_with_obstacle(path[k], obs, margin=SAFETY_MARGIN * 0.5):
                     any_collision = True
+                    # Push point away from obstacle center/centroid
                     if obs['type'] == 'circle':
                         center = np.array([obs['cx'], obs['cy']])
                         escape_r = obs['r'] + SAFETY_MARGIN
@@ -561,6 +569,7 @@ def post_process_collision_repair(path, obstacles, max_passes=50):
                     diff = path[k] - center
                     dist = np.linalg.norm(diff)
                     if dist < 0.01:
+                        # Random nudge if exactly at center
                         diff = np.array([0.1, 0.1])
                         dist = np.linalg.norm(diff)
                     direction = diff / dist
@@ -573,79 +582,74 @@ def post_process_collision_repair(path, obstacles, max_passes=50):
     for _ in range(20):
         for k in range(1, len(path) - 1):
             smoothed = 0.5 * path[k] + 0.25 * (path[k-1] + path[k+1])
+            # Only apply if it doesn't cause a collision
             if not any(point_collides_with_obstacle(smoothed, obs, margin=SAFETY_MARGIN * 0.3) for obs in obstacles):
                 path[k] = smoothed
 
     return path
 
+
 def optimize_path(start, goal, obstacles, seed=None):
     """
-    Optimize path waypoints combining APF Euler force queries with line-integral elastic band tension.
+    Optimize path waypoints using gradient descent.
 
-    Vector Calculus: GRADIENT DESCENT on line integral cost functional
-        + CONTINUOUS FORCE FIELD interpolation F_rep(X,Y).
+    Vector Calculus: GRADIENT DESCENT on cost functional
+        P_k^{new} = P_k - η * ∂Cost/∂P_k
+        Iteratively minimizes the line integral of arc length
+        subject to obstacle avoidance constraints.
 
     Returns:
-        optimized_path, initial_path, cost_history, path_snapshots, obstacles, seed, grid_data
+        optimized_path, initial_path, cost_history, path_snapshots, obstacles, seed
     """
+    # Generate randomized obstacles if none provided as dicts
     if not obstacles or (isinstance(obstacles[0], (tuple, list)) and len(obstacles[0]) == 3):
         obstacles, seed = generate_random_obstacles(seed)
     elif seed is None:
         seed = int(time.time() * 1000) % (2**31)
 
+    # Convert to circle primitives for gradient computation
     circle_primitives = obstacles_to_circle_primitives(obstacles)
-    
-    # Pre-compute the force field over a grid for interpolation
-    grid_res = 100
-    x_grid = np.linspace(-1.5, 11.5, grid_res)
-    y_grid = np.linspace(-1.5, 11.5, grid_res)
-    X, Y = np.meshgrid(x_grid, y_grid)
-    
-    V, Fx, Fy, F_rep_x, F_rep_y, divergence, curl = compute_potential_gradient_field(X, Y, goal, circle_primitives)
-    grid_data = (x_grid, y_grid, V, Fx, Fy, divergence, curl)
-    
-    # Setup RegularGridInterpolator for the repulsive forces
-    interp_Fx_rep = RegularGridInterpolator((y_grid, x_grid), F_rep_x, bounds_error=False, fill_value=0)
-    interp_Fy_rep = RegularGridInterpolator((y_grid, x_grid), F_rep_y, bounds_error=False, fill_value=0)
-    
+    circle_primitives_arr = np.array(circle_primitives) if circle_primitives else np.empty((0, 3))
+
     path = create_straight_path(start, goal, N_WAYPOINTS)
     initial_path = path.copy()
-    
+
     cost_history = []
     path_snapshots = [path.copy()]
-    
+
     for iteration in range(MAX_ITERATIONS):
-        # Compute gradient incorporating the interpolated Continuous Force Field
-        grad = compute_total_gradient_apf(path, interp_Fx_rep, interp_Fy_rep)
-        
+        # Compute gradient (vectorized)
+        grad = compute_total_gradient(path, circle_primitives_arr)
+
         # Adaptive learning rate (decay)
         lr = LEARNING_RATE * (1.0 / (1.0 + iteration * 0.001))
-        
+
         # Gradient descent update (only internal waypoints)
         path[1:-1] -= lr * grad[1:-1]
-        
-        # Clamp to bounds
+
+        # Clamp to workspace bounds
         path[:, 0] = np.clip(path[:, 0], -1, 11)
         path[:, 1] = np.clip(path[:, 1], -1, 11)
-        
-        # Cost history (path length / line integral)
+
+        # Track cost (path length = line integral)
         length = compute_path_length(path)
         cost_history.append(length)
-        
+
+        # Save snapshots for animation
         if iteration % (MAX_ITERATIONS // 8) == 0:
             path_snapshots.append(path.copy())
-            
-        # Convergence
+
+        # Convergence check
         if iteration > 50:
             recent = cost_history[-30:]
             if max(recent) - min(recent) < 1e-6:
                 break
-                
-    # Repair any residual collisions
+
+    # Post-process: ensure collision-free
     path = post_process_collision_repair(path, obstacles)
-    path_snapshots.append(path.copy())
-    
-    return path, initial_path, cost_history, path_snapshots, obstacles, seed, grid_data
+
+    path_snapshots.append(path.copy())  # Final path
+    return path, initial_path, cost_history, path_snapshots, obstacles, seed
 
 
 # ==============================================================================
@@ -697,7 +701,7 @@ def draw_obstacles(ax, obstacles, style='default'):
                     fontsize=6, fontweight='bold', color='white', zorder=4)
 
 
-def plot_all_results(X, Y, V, Fx, Fy, curl, initial_path, optimized_path,
+def plot_all_results(X, Y, V, Fx, Fy, initial_path, optimized_path,
                      cost_history, path_snapshots, obstacles, start, goal,
                      initial_length, final_length):
     """Generate the complete 4-panel visualization figure."""
@@ -807,23 +811,32 @@ def plot_all_results(X, Y, V, Fx, Fy, curl, initial_path, optimized_path,
     ax3.set_aspect('equal')
     ax3.grid(True, alpha=0.3)
 
-    # ── PLOT 4: Curl Magnitude Map (∇×F) ──
+    # ── PLOT 4: Convergence Graph (Cost vs Iteration) ──
     ax4 = axes[1, 1]
-    
-    # Render the curl to show it is almost zero everywhere (conservative field)
-    c_plot = ax4.contourf(X, Y, curl, levels=30, cmap='coolwarm', alpha=0.8)
-    fig.colorbar(c_plot, ax=ax4, fraction=0.046, pad=0.04)
+    iters = np.arange(len(cost_history))
 
-    draw_obstacles(ax4, obstacles)
-    ax4.plot(*start, '*', color='limegreen', markersize=15, markeredgecolor='black', zorder=6)
-    ax4.plot(*goal, '*', color='red', markersize=15, markeredgecolor='black', zorder=6)
+    # Color gradient line (red → green)
+    points = np.array([iters, cost_history]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = plt.Normalize(0, len(cost_history) - 1)
+    lc = LineCollection(segments, cmap='RdYlGn', norm=norm)
+    lc.set_array(iters[:-1])
+    lc.set_linewidth(2.5)
+    ax4.add_collection(lc)
 
-    ax4.set_title(r'Conservative Verification: Curl $\nabla \times \mathbf{F} \approx 0$', fontsize=13, fontweight='bold')
-    ax4.set_xlabel('X', fontsize=11)
-    ax4.set_ylabel('Y', fontsize=11)
-    ax4.set_xlim(-0.5, 10.5)
-    ax4.set_ylim(-0.5, 10.5)
-    ax4.set_aspect('equal')
+    # Reference lines
+    ax4.axhline(y=initial_length, color='red', linestyle='--', alpha=0.6,
+                label=f'Initial Length ({initial_length:.2f})')
+    ax4.axhline(y=final_length, color='green', linestyle='--', alpha=0.6,
+                label=f'Final Length ({final_length:.2f})')
+
+    ax4.set_title('Convergence: Path Length vs Iteration', fontsize=13, fontweight='bold')
+    ax4.set_xlabel('Iteration Number', fontsize=11)
+    ax4.set_ylabel('Path Length (Line Integral)', fontsize=11)
+    ax4.set_xlim(0, len(cost_history) - 1)
+    ax4.set_ylim(min(cost_history) * 0.95, max(cost_history) * 1.05)
+    ax4.legend(loc='upper right', fontsize=9, framealpha=0.9)
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig('path_optimization_results.png', dpi=200, bbox_inches='tight')
@@ -947,7 +960,7 @@ def main():
     x_grid = np.linspace(-0.5, 10.5, grid_res)
     y_grid = np.linspace(-0.5, 10.5, grid_res)
     X, Y = np.meshgrid(x_grid, y_grid)
-    V, Fx, Fy, F_rep_x, F_rep_y, divergence, curl = compute_potential_gradient_field(X, Y, GOAL, circle_primitives)
+    V, Fx, Fy, divergence = compute_potential_gradient_field(X, Y, GOAL, circle_primitives)
     print(f"  Potential range: [{V.min():.2f}, {V.max():.2f}]")
     print(f"  Force magnitude range: [{np.hypot(Fx,Fy).min():.4f}, {np.hypot(Fx,Fy).max():.4f}]")
     print(f"  Divergence range: [{divergence.min():.2f}, {divergence.max():.2f}]")
@@ -963,7 +976,7 @@ def main():
     # ── Run Gradient Descent Optimization ──
     print(f"\n[STEP 3] Running gradient descent optimization ({MAX_ITERATIONS} max iterations)...")
     t_start = time.time()
-    optimized_path, _, cost_history, path_snapshots, obstacles, seed, grid_data = optimize_path(START, GOAL, obstacles)
+    optimized_path, _, cost_history, path_snapshots, obstacles, seed = optimize_path(START, GOAL, obstacles)
     t_elapsed = time.time() - t_start
 
     final_length = compute_path_length(optimized_path)
@@ -989,7 +1002,7 @@ def main():
 
     # ── Visualization ──
     print("\n[STEP 5] Generating visualizations...")
-    plot_all_results(X, Y, V, Fx, Fy, curl, initial_path, optimized_path,
+    plot_all_results(X, Y, V, Fx, Fy, initial_path, optimized_path,
                      cost_history, path_snapshots, obstacles, START, GOAL,
                      initial_length, final_length)
 
