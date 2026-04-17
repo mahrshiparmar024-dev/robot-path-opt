@@ -70,6 +70,7 @@ Expected Outputs:
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.collections import LineCollection
 from matplotlib import cm
 import time
@@ -81,24 +82,310 @@ import time
 START = np.array([0.0, 0.0])
 GOAL = np.array([10.0, 10.0])
 
-# Obstacles: (center_x, center_y, radius) — placed to block the diagonal
-OBSTACLES = [
-    (2.5, 2.5, 0.9),   # On diagonal — blocks straight path
-    (5.0, 5.8, 1.1),   # Slightly above diagonal
-    (7.0, 4.5, 1.0),   # Below diagonal
-    (8.5, 8.0, 0.8),   # Near diagonal, close to goal
-]
-
 # Optimization parameters
-N_WAYPOINTS = 40          # Internal waypoints (total path = N+2 points)
-LEARNING_RATE = 0.01      # Gradient descent step size
-MAX_ITERATIONS = 800      # Maximum optimization iterations
-K_OBS = 8.0               # Obstacle repulsion strength
-K_SMOOTH = 0.15           # Path smoothness weight
-SAFETY_MARGIN = 0.4       # Extra clearance around obstacles
-RHO_0 = 2.5               # Obstacle influence radius beyond surface
-GRAD_CLIP = 3.0           # Maximum gradient magnitude per waypoint
+N_WAYPOINTS = 50          # Internal waypoints (total path = N+2 points)
+LEARNING_RATE = 0.015     # Gradient descent step size
+MAX_ITERATIONS = 1000     # Maximum optimization iterations
+K_OBS = 15.0              # Obstacle repulsion strength
+K_SMOOTH = 0.12           # Path smoothness weight
+SAFETY_MARGIN = 0.5       # Extra clearance around obstacles
+RHO_0 = 3.0               # Obstacle influence radius beyond surface
+GRAD_CLIP = 4.0           # Maximum gradient magnitude per waypoint
 K_ATT = 1.0               # Attractive potential gain (for field visualization)
+
+
+# ==============================================================================
+# OBSTACLE DEFINITIONS — Mixed shapes: Circles, Rectangles, L-shapes, Polygons
+# ==============================================================================
+
+# Obstacle format:
+#   Circle:    {'type': 'circle', 'cx': ..., 'cy': ..., 'r': ...}
+#   Rectangle: {'type': 'rect', 'cx': ..., 'cy': ..., 'w': ..., 'h': ..., 'angle': ...}
+#   Polygon:   {'type': 'polygon', 'vertices': [(x1,y1), ...]}
+
+def generate_random_obstacles(seed=None):
+    """
+    Generate a randomized, challenging set of mixed-shape obstacles.
+    Each call with a different seed produces a unique environment.
+    """
+    if seed is None:
+        seed = int(time.time() * 1000) % (2**31)
+    rng = np.random.RandomState(seed)
+
+    obstacles = []
+
+    # --- Layer 1: Circle obstacles scattered across the field ---
+    circle_configs = [
+        # Near start region
+        {'cx_range': (1.5, 3.0), 'cy_range': (1.5, 3.5), 'r_range': (0.5, 1.0)},
+        {'cx_range': (0.5, 2.0), 'cy_range': (3.5, 5.5), 'r_range': (0.4, 0.8)},
+        # Mid-field blockers
+        {'cx_range': (4.0, 6.0), 'cy_range': (4.5, 6.5), 'r_range': (0.7, 1.2)},
+        {'cx_range': (3.5, 5.0), 'cy_range': (7.0, 8.5), 'r_range': (0.5, 0.9)},
+        # Near goal region
+        {'cx_range': (7.5, 9.0), 'cy_range': (7.5, 9.0), 'r_range': (0.5, 1.0)},
+        {'cx_range': (8.0, 9.5), 'cy_range': (5.5, 7.5), 'r_range': (0.4, 0.8)},
+        # Diagonal blockers
+        {'cx_range': (6.0, 7.5), 'cy_range': (3.0, 5.0), 'r_range': (0.6, 1.0)},
+    ]
+    for cfg in circle_configs:
+        cx = rng.uniform(*cfg['cx_range'])
+        cy = rng.uniform(*cfg['cy_range'])
+        r = rng.uniform(*cfg['r_range'])
+        obstacles.append({'type': 'circle', 'cx': cx, 'cy': cy, 'r': r})
+
+    # --- Layer 2: Rectangular obstacles (walls/barriers) ---
+    rect_configs = [
+        # Horizontal wall near start
+        {'cx_range': (2.0, 4.0), 'cy_range': (2.0, 3.0), 'w_range': (1.5, 2.5), 'h_range': (0.4, 0.7), 'angle_range': (-15, 15)},
+        # Vertical wall in mid-field
+        {'cx_range': (5.5, 7.0), 'cy_range': (5.5, 7.5), 'w_range': (0.4, 0.7), 'h_range': (1.5, 2.5), 'angle_range': (-20, 20)},
+        # Angled barrier near goal
+        {'cx_range': (7.0, 8.5), 'cy_range': (8.5, 9.5), 'w_range': (1.2, 2.0), 'h_range': (0.4, 0.6), 'angle_range': (20, 50)},
+        # Another wall blocking mid-path
+        {'cx_range': (3.0, 5.0), 'cy_range': (5.0, 6.5), 'w_range': (1.8, 2.8), 'h_range': (0.3, 0.6), 'angle_range': (-30, 30)},
+    ]
+    for cfg in rect_configs:
+        cx = rng.uniform(*cfg['cx_range'])
+        cy = rng.uniform(*cfg['cy_range'])
+        w = rng.uniform(*cfg['w_range'])
+        h = rng.uniform(*cfg['h_range'])
+        angle = rng.uniform(*cfg['angle_range'])
+        obstacles.append({'type': 'rect', 'cx': cx, 'cy': cy, 'w': w, 'h': h, 'angle': angle})
+
+    # --- Layer 3: L-shaped & T-shaped obstacles (compound polygons) ---
+    def make_L_shape(base_x, base_y, arm_len, arm_w, rot_angle):
+        """Create an L-shaped polygon."""
+        pts = np.array([
+            [0, 0],
+            [arm_len, 0],
+            [arm_len, arm_w],
+            [arm_w, arm_w],
+            [arm_w, arm_len],
+            [0, arm_len],
+        ], dtype=float)
+        # Center
+        pts -= pts.mean(axis=0)
+        # Rotate
+        theta = np.radians(rot_angle)
+        R = np.array([[np.cos(theta), -np.sin(theta)],
+                       [np.sin(theta),  np.cos(theta)]])
+        pts = pts @ R.T
+        # Translate
+        pts += np.array([base_x, base_y])
+        return pts.tolist()
+
+    l_configs = [
+        {'base_x_range': (1.0, 2.5), 'base_y_range': (5.0, 7.0), 'arm_len_range': (1.2, 1.8), 'arm_w_range': (0.35, 0.55), 'angle_range': (0, 90)},
+        {'base_x_range': (6.5, 8.5), 'base_y_range': (2.0, 4.0), 'arm_len_range': (1.0, 1.6), 'arm_w_range': (0.3, 0.5), 'angle_range': (90, 270)},
+    ]
+    for cfg in l_configs:
+        bx = rng.uniform(*cfg['base_x_range'])
+        by = rng.uniform(*cfg['base_y_range'])
+        al = rng.uniform(*cfg['arm_len_range'])
+        aw = rng.uniform(*cfg['arm_w_range'])
+        ang = rng.uniform(*cfg['angle_range'])
+        verts = make_L_shape(bx, by, al, aw, ang)
+        obstacles.append({'type': 'polygon', 'vertices': verts})
+
+    # --- Layer 4: Triangular barriers ---
+    tri_configs = [
+        {'cx_range': (3.5, 5.5), 'cy_range': (1.0, 2.5), 'size_range': (0.8, 1.3), 'angle_range': (0, 360)},
+        {'cx_range': (8.0, 9.5), 'cy_range': (4.0, 6.0), 'size_range': (0.6, 1.0), 'angle_range': (0, 360)},
+    ]
+    for cfg in tri_configs:
+        cx = rng.uniform(*cfg['cx_range'])
+        cy = rng.uniform(*cfg['cy_range'])
+        size = rng.uniform(*cfg['size_range'])
+        angle_offset = rng.uniform(*cfg['angle_range'])
+        verts = []
+        for i in range(3):
+            a = np.radians(angle_offset + i * 120)
+            verts.append([cx + size * np.cos(a), cy + size * np.sin(a)])
+        obstacles.append({'type': 'polygon', 'vertices': verts})
+
+    # --- Layer 5: Small pentagon obstacle ---
+    pent_cx = rng.uniform(4.5, 6.5)
+    pent_cy = rng.uniform(2.5, 4.0)
+    pent_r = rng.uniform(0.5, 0.8)
+    pent_angle = rng.uniform(0, 72)
+    pent_verts = []
+    for i in range(5):
+        a = np.radians(pent_angle + i * 72)
+        pent_verts.append([pent_cx + pent_r * np.cos(a), pent_cy + pent_r * np.sin(a)])
+    obstacles.append({'type': 'polygon', 'vertices': pent_verts})
+
+    return obstacles, seed
+
+
+# Convert obstacles to a "collision primitive" representation for the optimizer
+def obstacle_to_circles(obstacle, n_samples=12):
+    """
+    Approximate any obstacle shape as a set of circles for the potential field.
+    This lets the gradient-based optimizer work uniformly on all shapes.
+    Returns list of (cx, cy, r) tuples.
+    """
+    if obstacle['type'] == 'circle':
+        return [(obstacle['cx'], obstacle['cy'], obstacle['r'])]
+
+    elif obstacle['type'] == 'rect':
+        cx, cy, w, h, angle = obstacle['cx'], obstacle['cy'], obstacle['w'], obstacle['h'], obstacle['angle']
+        theta = np.radians(angle)
+        R = np.array([[np.cos(theta), -np.sin(theta)],
+                       [np.sin(theta),  np.cos(theta)]])
+        circles = []
+        # Fill rectangle with small overlapping circles
+        min_dim = min(w, h)
+        ball_r = min_dim / 2.0
+        nx = max(1, int(np.ceil(w / (ball_r * 1.4))))
+        ny = max(1, int(np.ceil(h / (ball_r * 1.4))))
+        for ix in range(nx):
+            for iy in range(ny):
+                lx = -w/2 + (ix + 0.5) * w / nx
+                ly = -h/2 + (iy + 0.5) * h / ny
+                pt = R @ np.array([lx, ly]) + np.array([cx, cy])
+                circles.append((pt[0], pt[1], ball_r))
+        return circles
+
+    elif obstacle['type'] == 'polygon':
+        verts = np.array(obstacle['vertices'])
+        center = verts.mean(axis=0)
+        # Compute characteristic radius
+        dists = np.linalg.norm(verts - center, axis=1)
+        max_r = dists.max()
+
+        circles = []
+        # Center circle
+        circles.append((center[0], center[1], max_r * 0.4))
+
+        # Edge midpoint circles
+        n = len(verts)
+        for i in range(n):
+            mid = (verts[i] + verts[(i+1) % n]) / 2.0
+            edge_len = np.linalg.norm(verts[(i+1) % n] - verts[i])
+            circles.append((mid[0], mid[1], edge_len * 0.35))
+
+        # Vertex circles
+        for v in verts:
+            circles.append((v[0], v[1], max_r * 0.2))
+
+        return circles
+
+    return []
+
+
+def obstacles_to_circle_primitives(obstacles):
+    """Convert all obstacles to circle primitives for the optimizer."""
+    all_circles = []
+    for obs in obstacles:
+        all_circles.extend(obstacle_to_circles(obs))
+    return all_circles
+
+
+# ==============================================================================
+# COLLISION DETECTION — Handles all shape types
+# ==============================================================================
+
+def point_in_circle(point, cx, cy, r, margin=0.0):
+    return np.sqrt((point[0] - cx)**2 + (point[1] - cy)**2) < r + margin
+
+
+def point_in_rect(point, cx, cy, w, h, angle, margin=0.0):
+    """Check if a point is inside a rotated rectangle."""
+    theta = np.radians(-angle)
+    dx = point[0] - cx
+    dy = point[1] - cy
+    rx = dx * np.cos(theta) - dy * np.sin(theta)
+    ry = dx * np.sin(theta) + dy * np.cos(theta)
+    return abs(rx) < (w/2 + margin) and abs(ry) < (h/2 + margin)
+
+
+def point_in_polygon(point, vertices, margin=0.0):
+    """Check if point is inside polygon using ray casting, with margin via inflation."""
+    verts = np.array(vertices)
+    center = verts.mean(axis=0)
+    # Inflate polygon outward by margin
+    if margin > 0:
+        inflated = []
+        for v in verts:
+            direction = v - center
+            d = np.linalg.norm(direction)
+            if d > 0:
+                inflated.append(v + margin * direction / d)
+            else:
+                inflated.append(v)
+        verts = np.array(inflated)
+
+    # Ray casting
+    n = len(verts)
+    inside = False
+    px, py = point[0], point[1]
+    j = n - 1
+    for i in range(n):
+        xi, yi = verts[i]
+        xj, yj = verts[j]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def point_collides_with_obstacle(point, obstacle, margin=0.0):
+    """Check if a point collides with any obstacle type."""
+    if obstacle['type'] == 'circle':
+        return point_in_circle(point, obstacle['cx'], obstacle['cy'], obstacle['r'], margin)
+    elif obstacle['type'] == 'rect':
+        return point_in_rect(point, obstacle['cx'], obstacle['cy'], obstacle['w'], obstacle['h'], obstacle['angle'], margin)
+    elif obstacle['type'] == 'polygon':
+        return point_in_polygon(point, obstacle['vertices'], margin)
+    return False
+
+
+def check_collision(path, obstacles, margin=0.0):
+    """Check if any point on the path collides with any obstacle."""
+    for point in path:
+        for obs in obstacles:
+            if point_collides_with_obstacle(point, obs, margin):
+                return True
+    return False
+
+
+def distance_to_obstacle(point, obstacle):
+    """Compute approximate distance from point to obstacle surface."""
+    if obstacle['type'] == 'circle':
+        d = np.sqrt((point[0] - obstacle['cx'])**2 + (point[1] - obstacle['cy'])**2)
+        return max(d - obstacle['r'], 0.0)
+    elif obstacle['type'] == 'rect':
+        # Distance to rotated rectangle
+        cx, cy, w, h, angle = obstacle['cx'], obstacle['cy'], obstacle['w'], obstacle['h'], obstacle['angle']
+        theta = np.radians(-angle)
+        dx = point[0] - cx
+        dy = point[1] - cy
+        rx = dx * np.cos(theta) - dy * np.sin(theta)
+        ry = dx * np.sin(theta) + dy * np.cos(theta)
+        # Distance to rectangle boundary
+        dx_r = max(abs(rx) - w/2, 0)
+        dy_r = max(abs(ry) - h/2, 0)
+        return np.sqrt(dx_r**2 + dy_r**2)
+    elif obstacle['type'] == 'polygon':
+        verts = np.array(obstacle['vertices'])
+        # Distance to nearest edge
+        min_dist = float('inf')
+        n = len(verts)
+        for i in range(n):
+            a = verts[i]
+            b = verts[(i+1) % n]
+            # Point-to-segment distance
+            ab = b - a
+            ap = point - a
+            t = np.clip(np.dot(ap, ab) / (np.dot(ab, ab) + 1e-15), 0, 1)
+            closest = a + t * ab
+            dist = np.linalg.norm(point - closest)
+            min_dist = min(min_dist, dist)
+        if point_in_polygon(point, obstacle['vertices']):
+            return 0.0
+        return min_dist
+    return float('inf')
 
 
 # ==============================================================================
@@ -116,16 +403,16 @@ def attractive_potential(X, Y, goal):
     return 0.5 * K_ATT * ((X - goal[0])**2 + (Y - goal[1])**2)
 
 
-def repulsive_potential(X, Y, obstacles):
+def repulsive_potential(X, Y, circle_primitives):
     """
-    Compute repulsive potential field for all obstacles.
+    Compute repulsive potential field for all obstacle circle primitives.
 
     Vector Calculus: SCALAR FIELD with localized support
         V_rep = 0.5 * k_rep * (1/ρ - 1/ρ₀)²  for ρ ≤ ρ₀
         where ρ = distance to obstacle surface
     """
     V = np.zeros_like(X, dtype=float)
-    for cx, cy, r in obstacles:
+    for cx, cy, r in circle_primitives:
         dist_center = np.sqrt((X - cx)**2 + (Y - cy)**2)
         rho = np.maximum(dist_center - r, 0.01)  # distance to surface
         mask = rho <= RHO_0
@@ -133,12 +420,12 @@ def repulsive_potential(X, Y, obstacles):
     return V
 
 
-def total_potential(X, Y, goal, obstacles):
+def total_potential(X, Y, goal, circle_primitives):
     """Total scalar potential field V = V_att + V_rep."""
-    return attractive_potential(X, Y, goal) + repulsive_potential(X, Y, obstacles)
+    return attractive_potential(X, Y, goal) + repulsive_potential(X, Y, circle_primitives)
 
 
-def compute_potential_gradient_field(X, Y, goal, obstacles):
+def compute_potential_gradient_field(X, Y, goal, circle_primitives):
     """
     Compute the negative gradient (force field) F = -∇V over the grid.
 
@@ -148,7 +435,7 @@ def compute_potential_gradient_field(X, Y, goal, obstacles):
 
     Also computes DIVERGENCE: div(F) = ∂Fx/∂x + ∂Fy/∂y
     """
-    V = total_potential(X, Y, goal, obstacles)
+    V = total_potential(X, Y, goal, circle_primitives)
     dV_dy, dV_dx = np.gradient(V)
     Fx, Fy = -dV_dx, -dV_dy  # Force = negative gradient
 
@@ -189,20 +476,11 @@ def compute_path_length(path):
     return np.sum(np.linalg.norm(segments, axis=1))
 
 
-def check_collision(path, obstacles, margin=0.0):
-    """Check if any point on the path collides with obstacles."""
-    for point in path:
-        for cx, cy, r in obstacles:
-            if np.sqrt((point[0] - cx)**2 + (point[1] - cy)**2) < r + margin:
-                return True
-    return False
-
-
 # ==============================================================================
 # GRADIENT DESCENT OPTIMIZATION (Vector Calculus: Gradient)
 # ==============================================================================
 
-def compute_total_gradient(path, obstacles):
+def compute_total_gradient(path, circle_primitives):
     """
     Compute the analytical gradient of the total cost w.r.t. waypoints.
 
@@ -229,7 +507,7 @@ def compute_total_gradient(path, obstacles):
 
         # ── 2. OBSTACLE REPULSION GRADIENT (Potential Field) ──
         # ∂V_rep/∂P_k = K * (1/ρ - 1/ρ₀) * (1/ρ²) * (-(P_k - center)/d)
-        for cx, cy, r in obstacles:
+        for cx, cy, r in circle_primitives:
             center = np.array([cx, cy])
             diff = path[k] - center
             d = np.linalg.norm(diff)
@@ -255,7 +533,53 @@ def compute_total_gradient(path, obstacles):
     return grad
 
 
-def optimize_path(start, goal, obstacles):
+def post_process_collision_repair(path, obstacles, max_passes=50):
+    """
+    Post-optimization pass: push any colliding waypoints away from obstacles.
+    Ensures the final path is truly collision-free.
+    """
+    for _ in range(max_passes):
+        any_collision = False
+        for k in range(1, len(path) - 1):
+            for obs in obstacles:
+                if point_collides_with_obstacle(path[k], obs, margin=SAFETY_MARGIN * 0.5):
+                    any_collision = True
+                    # Push point away from obstacle center/centroid
+                    if obs['type'] == 'circle':
+                        center = np.array([obs['cx'], obs['cy']])
+                        escape_r = obs['r'] + SAFETY_MARGIN
+                    elif obs['type'] == 'rect':
+                        center = np.array([obs['cx'], obs['cy']])
+                        escape_r = np.sqrt((obs['w']/2)**2 + (obs['h']/2)**2) + SAFETY_MARGIN
+                    elif obs['type'] == 'polygon':
+                        verts = np.array(obs['vertices'])
+                        center = verts.mean(axis=0)
+                        escape_r = np.max(np.linalg.norm(verts - center, axis=1)) + SAFETY_MARGIN
+
+                    diff = path[k] - center
+                    dist = np.linalg.norm(diff)
+                    if dist < 0.01:
+                        # Random nudge if exactly at center
+                        diff = np.array([0.1, 0.1])
+                        dist = np.linalg.norm(diff)
+                    direction = diff / dist
+                    path[k] = center + direction * escape_r
+
+        if not any_collision:
+            break
+
+    # Light smoothing pass to prevent sharp kinks from repair
+    for _ in range(20):
+        for k in range(1, len(path) - 1):
+            smoothed = 0.5 * path[k] + 0.25 * (path[k-1] + path[k+1])
+            # Only apply if it doesn't cause a collision
+            if not any(point_collides_with_obstacle(smoothed, obs, margin=SAFETY_MARGIN * 0.3) for obs in obstacles):
+                path[k] = smoothed
+
+    return path
+
+
+def optimize_path(start, goal, obstacles, seed=None):
     """
     Optimize path waypoints using gradient descent.
 
@@ -265,8 +589,17 @@ def optimize_path(start, goal, obstacles):
         subject to obstacle avoidance constraints.
 
     Returns:
-        optimized_path, initial_path, cost_history, path_snapshots
+        optimized_path, initial_path, cost_history, path_snapshots, obstacles, seed
     """
+    # Generate randomized obstacles if none provided as dicts
+    if not obstacles or (isinstance(obstacles[0], (tuple, list)) and len(obstacles[0]) == 3):
+        obstacles, seed = generate_random_obstacles(seed)
+    elif seed is None:
+        seed = int(time.time() * 1000) % (2**31)
+
+    # Convert to circle primitives for gradient computation
+    circle_primitives = obstacles_to_circle_primitives(obstacles)
+
     path = create_straight_path(start, goal, N_WAYPOINTS)
     initial_path = path.copy()
 
@@ -275,7 +608,7 @@ def optimize_path(start, goal, obstacles):
 
     for iteration in range(MAX_ITERATIONS):
         # Compute gradient
-        grad = compute_total_gradient(path, obstacles)
+        grad = compute_total_gradient(path, circle_primitives)
 
         # Adaptive learning rate (decay)
         lr = LEARNING_RATE * (1.0 / (1.0 + iteration * 0.001))
@@ -296,13 +629,16 @@ def optimize_path(start, goal, obstacles):
             path_snapshots.append(path.copy())
 
         # Convergence check
-        if iteration > 10:
-            recent = cost_history[-10:]
-            if max(recent) - min(recent) < 1e-5:
+        if iteration > 50:
+            recent = cost_history[-30:]
+            if max(recent) - min(recent) < 1e-6:
                 break
 
+    # Post-process: ensure collision-free
+    path = post_process_collision_repair(path, obstacles)
+
     path_snapshots.append(path.copy())  # Final path
-    return path, initial_path, cost_history, path_snapshots
+    return path, initial_path, cost_history, path_snapshots, obstacles, seed
 
 
 # ==============================================================================
@@ -310,18 +646,48 @@ def optimize_path(start, goal, obstacles):
 # ==============================================================================
 
 def draw_obstacles(ax, obstacles, style='default'):
-    """Draw obstacles on an axis."""
-    for i, (cx, cy, r) in enumerate(obstacles):
-        if style == 'clean':
-            color, edge, alpha = '#E53935', '#B71C1C', 0.85
-        else:
-            color, edge, alpha = '#FF5252', '#D32F2F', 0.8
-        circle = mpatches.Circle((cx, cy), r, facecolor=color,
-                                  edgecolor=edge, linewidth=1.5,
-                                  alpha=alpha, zorder=3)
-        ax.add_patch(circle)
-        ax.text(cx, cy, f'O{i+1}', ha='center', va='center',
-                fontsize=7, fontweight='bold', color='white', zorder=4)
+    """Draw all obstacle types on an axis."""
+    colors_map = {
+        'circle': ('#E53935', '#B71C1C') if style == 'clean' else ('#FF5252', '#D32F2F'),
+        'rect': ('#AB47BC', '#6A1B9A') if style == 'clean' else ('#CE93D8', '#8E24AA'),
+        'polygon': ('#FF7043', '#BF360C') if style == 'clean' else ('#FFAB91', '#E64A19'),
+    }
+
+    for i, obs in enumerate(obstacles):
+        otype = obs['type']
+        face_c, edge_c = colors_map.get(otype, ('#E53935', '#B71C1C'))
+        alpha = 0.85 if style == 'clean' else 0.75
+
+        if otype == 'circle':
+            circle = mpatches.Circle((obs['cx'], obs['cy']), obs['r'],
+                                      facecolor=face_c, edgecolor=edge_c,
+                                      linewidth=1.5, alpha=alpha, zorder=3)
+            ax.add_patch(circle)
+            ax.text(obs['cx'], obs['cy'], f'C{i+1}', ha='center', va='center',
+                    fontsize=6, fontweight='bold', color='white', zorder=4)
+
+        elif otype == 'rect':
+            cx, cy, w, h, angle = obs['cx'], obs['cy'], obs['w'], obs['h'], obs['angle']
+            rect = mpatches.FancyBboxPatch((-w/2, -h/2), w, h,
+                                            boxstyle="round,pad=0.02",
+                                            facecolor=face_c, edgecolor=edge_c,
+                                            linewidth=1.5, alpha=alpha, zorder=3)
+            t = plt.matplotlib.transforms.Affine2D().rotate_deg(angle).translate(cx, cy) + ax.transData
+            rect.set_transform(t)
+            ax.add_patch(rect)
+            ax.text(cx, cy, f'R{i+1}', ha='center', va='center',
+                    fontsize=6, fontweight='bold', color='white', zorder=4,
+                    rotation=angle)
+
+        elif otype == 'polygon':
+            verts = np.array(obs['vertices'])
+            polygon = MplPolygon(verts, closed=True,
+                                  facecolor=face_c, edgecolor=edge_c,
+                                  linewidth=1.5, alpha=alpha, zorder=3)
+            ax.add_patch(polygon)
+            center = verts.mean(axis=0)
+            ax.text(center[0], center[1], f'P{i+1}', ha='center', va='center',
+                    fontsize=6, fontweight='bold', color='white', zorder=4)
 
 
 def plot_all_results(X, Y, V, Fx, Fy, initial_path, optimized_path,
@@ -559,11 +925,23 @@ def main():
     print("  Gradient-Based Optimization Using Vector Calculus")
     print("=" * 80)
 
-    # ── Environment Setup ──
-    print(f"\n[SETUP] Start: {tuple(START)}, Goal: {tuple(GOAL)}")
-    print(f"[SETUP] Obstacles: {len(OBSTACLES)}")
-    for i, (cx, cy, r) in enumerate(OBSTACLES):
-        print(f"  O{i+1}: center=({cx}, {cy}), radius={r}")
+    # ── Generate Random Obstacles ──
+    obstacles, seed = generate_random_obstacles()
+    print(f"\n[SETUP] Random seed: {seed}")
+    print(f"[SETUP] Start: {tuple(START)}, Goal: {tuple(GOAL)}")
+    print(f"[SETUP] Obstacles generated: {len(obstacles)}")
+    for i, obs in enumerate(obstacles):
+        if obs['type'] == 'circle':
+            print(f"  #{i+1}: Circle — center=({obs['cx']:.2f}, {obs['cy']:.2f}), radius={obs['r']:.2f}")
+        elif obs['type'] == 'rect':
+            print(f"  #{i+1}: Rectangle — center=({obs['cx']:.2f}, {obs['cy']:.2f}), {obs['w']:.2f}x{obs['h']:.2f}, angle={obs['angle']:.1f}°")
+        elif obs['type'] == 'polygon':
+            n_verts = len(obs['vertices'])
+            center = np.array(obs['vertices']).mean(axis=0)
+            print(f"  #{i+1}: Polygon ({n_verts} vertices) — centroid=({center[0]:.2f}, {center[1]:.2f})")
+
+    # Convert to circle primitives for potential field
+    circle_primitives = obstacles_to_circle_primitives(obstacles)
 
     # ── Compute Potential Field for Visualization ──
     print("\n[STEP 1] Computing potential field V(x,y) over workspace...")
@@ -571,7 +949,7 @@ def main():
     x_grid = np.linspace(-0.5, 10.5, grid_res)
     y_grid = np.linspace(-0.5, 10.5, grid_res)
     X, Y = np.meshgrid(x_grid, y_grid)
-    V, Fx, Fy, divergence = compute_potential_gradient_field(X, Y, GOAL, OBSTACLES)
+    V, Fx, Fy, divergence = compute_potential_gradient_field(X, Y, GOAL, circle_primitives)
     print(f"  Potential range: [{V.min():.2f}, {V.max():.2f}]")
     print(f"  Force magnitude range: [{np.hypot(Fx,Fy).min():.4f}, {np.hypot(Fx,Fy).max():.4f}]")
     print(f"  Divergence range: [{divergence.min():.2f}, {divergence.max():.2f}]")
@@ -580,18 +958,18 @@ def main():
     print("\n[STEP 2] Creating initial straight-line path r(t) = (1-t)·start + t·goal...")
     initial_path = create_straight_path(START, GOAL, N_WAYPOINTS)
     initial_length = compute_path_length(initial_path)
-    initial_collision = check_collision(initial_path, OBSTACLES)
+    initial_collision = check_collision(initial_path, obstacles)
     print(f"  Initial path length (line integral): {initial_length:.4f}")
     print(f"  Initial path collides with obstacles: {'YES ✗' if initial_collision else 'NO ✓'}")
 
     # ── Run Gradient Descent Optimization ──
     print(f"\n[STEP 3] Running gradient descent optimization ({MAX_ITERATIONS} max iterations)...")
     t_start = time.time()
-    optimized_path, _, cost_history, path_snapshots = optimize_path(START, GOAL, OBSTACLES)
+    optimized_path, _, cost_history, path_snapshots, obstacles, seed = optimize_path(START, GOAL, obstacles)
     t_elapsed = time.time() - t_start
 
     final_length = compute_path_length(optimized_path)
-    final_collision = check_collision(optimized_path, OBSTACLES)
+    final_collision = check_collision(optimized_path, obstacles)
     n_iters = len(cost_history)
 
     print(f"  Optimization completed in {t_elapsed:.3f} seconds")
@@ -614,7 +992,7 @@ def main():
     # ── Visualization ──
     print("\n[STEP 5] Generating visualizations...")
     plot_all_results(X, Y, V, Fx, Fy, initial_path, optimized_path,
-                     cost_history, path_snapshots, OBSTACLES, START, GOAL,
+                     cost_history, path_snapshots, obstacles, START, GOAL,
                      initial_length, final_length)
 
     # ── Mermaid Diagrams ──
@@ -631,12 +1009,14 @@ def main():
 ├──────────────────────────────────────────────────────────────────────┤
 │  Start Point:                (0, 0)                                 │
 │  Goal Point:                 (10, 10)                               │
-│  Number of Obstacles:        {len(OBSTACLES)}                                    │
+│  Number of Obstacles:        {len(obstacles):<4}                                 │
+│  Obstacle Types:             Circles, Rectangles, L-shapes, Polygons│
+│  Random Seed:                {seed:<10}                             │
 │  Straight-Line Distance:     {straight_line_dist:.4f}                            │
 │  Initial Path Length:        {initial_length:.4f} (COLLIDES)                     │
 │  Optimized Path Length:      {final_length:.4f} (COLLISION-FREE)                │
 │  Length Overhead:            {pct_change:+.1f}% (cost of obstacle avoidance)     │
-│  Optimization Iterations:    {n_iters}                                   │
+│  Optimization Iterations:    {n_iters:<6}                                │
 │  Computation Time:           {t_elapsed:.3f} seconds                           │
 │  Waypoints Optimized:        {N_WAYPOINTS}                                   │
 └──────────────────────────────────────────────────────────────────────┘

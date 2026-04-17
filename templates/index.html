@@ -4,19 +4,22 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Robot Path Optimization</title>
+    <meta name="description" content="Interactive gradient-based robot path optimization with randomized mixed-shape obstacles.">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <script src="https://cdn.plot.ly/plotly-2.28.0.min.js"></script>
 </head>
 <body>
     <div class="page">
         <header>
-            <h1>Robot Path Optimization</h1>
-            <p>Interactive gradient-based path planning for a robot navigating around obstacles.</p>
+            <h1>🤖 Robot Path Optimization</h1>
+            <p>Interactive gradient-based path planning through randomized mixed-shape obstacles —
+               circles, rectangles, L-shapes &amp; polygons. Every run is unique.</p>
         </header>
 
         <section class="controls">
-            <button id="runButton">Run Simulation</button>
-            <span id="status">Press the button to load the simulation.</span>
+            <button id="runButton">🔄 New Random Run</button>
+            <input  id="seedInput" type="number" placeholder="Seed (optional)" title="Enter a seed for reproducible results">
+            <span   id="status">Loading first simulation…</span>
         </section>
 
         <section id="plot" class="plot"></section>
