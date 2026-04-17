@@ -618,7 +618,7 @@ def optimize_path(start, goal, obstacles, seed=None):
     circle_primitives = obstacles_to_circle_primitives(obstacles)
     
     # Pre-compute the force field over a grid for interpolation
-    grid_res = 300
+    grid_res = 100
     x_grid = np.linspace(-1.5, 11.5, grid_res)
     y_grid = np.linspace(-1.5, 11.5, grid_res)
     X, Y = np.meshgrid(x_grid, y_grid)
